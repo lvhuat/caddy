@@ -272,7 +272,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 	}
 
 	for _, h := range hopHeaders {
-		res.Header.Del(h)
+		delete(res.Header, h)
 	}
 
 	if respUpdateFn != nil {
@@ -280,77 +280,89 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 	}
 
 	if isWebsocket {
-		res.Body.Close()
-		hj, ok := rw.(http.Hijacker)
-		if !ok {
-			panic(httpserver.NonHijackerError{Underlying: rw})
-		}
+		rp.serveWebsocket(rw, outreq, transport, res)
+	} else {
+		rp.serveRegular(rw, outreq, transport, res)
+	}
 
-		conn, brw, err := hj.Hijack()
+	return nil
+}
+
+func (rp *ReverseProxy) serveRegular(rw http.ResponseWriter, outreq *http.Request, transport http.RoundTripper, res *http.Response) error {
+	shallowCopyHeader(rw.Header(), res.Header)
+
+	// The "Trailer" header isn't included in the Transport's response,
+	// at least for *http.Transport. Build it up from Trailer.
+	if len(res.Trailer) > 0 {
+		trailerKeys := make([]string, 0, len(res.Trailer))
+		for k := range res.Trailer {
+			trailerKeys = append(trailerKeys, k)
+		}
+		rw.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
+	}
+
+	rw.WriteHeader(res.StatusCode)
+	if len(res.Trailer) > 0 {
+		// Force chunking if we saw a response trailer.
+		// This prevents net/http from calculating the length for short
+		// bodies and adding a Content-Length.
+		if fl, ok := rw.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}
+	rp.copyResponse(rw, res.Body)
+	res.Body.Close() // close now, instead of defer, to populate res.Trailer
+	shallowCopyHeader(rw.Header(), res.Trailer)
+
+	return nil
+}
+
+func (rp *ReverseProxy) serveWebsocket(rw http.ResponseWriter, outreq *http.Request, transport http.RoundTripper, res *http.Response) error {
+	res.Body.Close()
+	hj, ok := rw.(http.Hijacker)
+	if !ok {
+		panic(httpserver.NonHijackerError{Underlying: rw})
+	}
+
+	conn, brw, err := hj.Hijack()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var backendConn net.Conn
+	if hj, ok := transport.(*connHijackerTransport); ok {
+		backendConn = hj.Conn
+		if _, err := conn.Write(hj.Replay); err != nil {
+			return err
+		}
+		bufferPool.Put(hj.Replay)
+	} else {
+		backendConn, err = net.Dial("tcp", outreq.URL.Host)
 		if err != nil {
 			return err
 		}
-		defer conn.Close()
+		outreq.Write(backendConn)
+	}
+	defer backendConn.Close()
 
-		var backendConn net.Conn
-		if hj, ok := transport.(*connHijackerTransport); ok {
-			backendConn = hj.Conn
-			if _, err := conn.Write(hj.Replay); err != nil {
-				return err
-			}
-			bufferPool.Put(hj.Replay)
-		} else {
-			backendConn, err = net.Dial("tcp", outreq.URL.Host)
+	// Proxy backend -> frontend.
+	go pooledIoCopy(conn, backendConn)
+
+	// Proxy frontend -> backend.
+	//
+	// NOTE: Hijack() sometimes returns buffered up bytes in brw which
+	// would be lost if we didn't read them out manually below.
+	if brw != nil {
+		if n := brw.Reader.Buffered(); n > 0 {
+			rbuf, err := brw.Reader.Peek(n)
 			if err != nil {
 				return err
 			}
-			outreq.Write(backendConn)
+			backendConn.Write(rbuf)
 		}
-		defer backendConn.Close()
-
-		// Proxy backend -> frontend.
-		go pooledIoCopy(conn, backendConn)
-
-		// Proxy frontend -> backend.
-		//
-		// NOTE: Hijack() sometimes returns buffered up bytes in brw which
-		// would be lost if we didn't read them out manually below.
-		if brw != nil {
-			if n := brw.Reader.Buffered(); n > 0 {
-				rbuf, err := brw.Reader.Peek(n)
-				if err != nil {
-					return err
-				}
-				backendConn.Write(rbuf)
-			}
-		}
-		pooledIoCopy(backendConn, conn)
-	} else {
-		shallowCopyHeader(rw.Header(), res.Header)
-
-		// The "Trailer" header isn't included in the Transport's response,
-		// at least for *http.Transport. Build it up from Trailer.
-		if len(res.Trailer) > 0 {
-			trailerKeys := make([]string, 0, len(res.Trailer))
-			for k := range res.Trailer {
-				trailerKeys = append(trailerKeys, k)
-			}
-			rw.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
-		}
-
-		rw.WriteHeader(res.StatusCode)
-		if len(res.Trailer) > 0 {
-			// Force chunking if we saw a response trailer.
-			// This prevents net/http from calculating the length for short
-			// bodies and adding a Content-Length.
-			if fl, ok := rw.(http.Flusher); ok {
-				fl.Flush()
-			}
-		}
-		rp.copyResponse(rw, res.Body)
-		res.Body.Close() // close now, instead of defer, to populate res.Trailer
-		shallowCopyHeader(rw.Header(), res.Trailer)
 	}
+	pooledIoCopy(backendConn, conn)
 
 	return nil
 }
