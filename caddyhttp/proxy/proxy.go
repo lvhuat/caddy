@@ -284,7 +284,7 @@ func createUpstreamRequest(r *http.Request) *http.Request {
 			if f = strings.TrimSpace(f); f != "" {
 				if !copiedHeaders {
 					outreq.Header = make(http.Header)
-					copyHeader(outreq.Header, r.Header)
+					shallowCopyHeader(outreq.Header, r.Header)
 					copiedHeaders = true
 				}
 				outreq.Header.Del(f)
@@ -299,7 +299,7 @@ func createUpstreamRequest(r *http.Request) *http.Request {
 		if outreq.Header.Get(h) != "" {
 			if !copiedHeaders {
 				outreq.Header = make(http.Header)
-				copyHeader(outreq.Header, r.Header)
+				shallowCopyHeader(outreq.Header, r.Header)
 				copiedHeaders = true
 			}
 			outreq.Header.Del(h)

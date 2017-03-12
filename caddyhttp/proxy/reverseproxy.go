@@ -326,7 +326,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		}
 		pooledIoCopy(backendConn, conn)
 	} else {
-		copyHeader(rw.Header(), res.Header)
+		shallowCopyHeader(rw.Header(), res.Header)
 
 		// The "Trailer" header isn't included in the Transport's response,
 		// at least for *http.Transport. Build it up from Trailer.
@@ -349,7 +349,7 @@ func (rp *ReverseProxy) ServeHTTP(rw http.ResponseWriter, outreq *http.Request, 
 		}
 		rp.copyResponse(rw, res.Body)
 		res.Body.Close() // close now, instead of defer, to populate res.Trailer
-		copyHeader(rw.Header(), res.Trailer)
+		shallowCopyHeader(rw.Header(), res.Trailer)
 	}
 
 	return nil
@@ -371,30 +371,34 @@ func (rp *ReverseProxy) copyResponse(dst io.Writer, src io.Reader) {
 	pooledIoCopy(dst, src)
 }
 
-// skip these headers if they already exist.
-// see https://github.com/mholt/caddy/pull/1112#discussion_r80092582
-var skipHeaders = map[string]struct{}{
-	"Content-Type":        {},
-	"Content-Disposition": {},
-	"Accept-Ranges":       {},
-	"Set-Cookie":          {},
-	"Cache-Control":       {},
-	"Expires":             {},
+func headerContains(header http.Header, key string) bool {
+	_, ok := header[key]
+	return ok
 }
 
-func copyHeader(dst, src http.Header) {
+// Skip these headers if they already exist.
+// See https://github.com/mholt/caddy/issues/1086
+// See https://github.com/mholt/caddy/pull/1112#discussion_r80092582
+var skipHeaders = http.Header{
+	"Content-Type":        nil,
+	"Content-Disposition": nil,
+	"Accept-Ranges":       nil,
+	"Set-Cookie":          nil,
+	"Cache-Control":       nil,
+	"Expires":             nil,
+}
+
+func shouldSkipHeader(dst http.Header, key string) bool {
+	return headerContains(dst, key) && headerContains(skipHeaders, key)
+}
+
+// shallowCopyHeader transfers all headers from src to dst.
+//
+// WARNING: Only a shallow copy will be created!
+func shallowCopyHeader(dst, src http.Header) {
 	for k, vv := range src {
-		if _, ok := dst[k]; ok {
-			// skip some predefined headers
-			// see https://github.com/mholt/caddy/issues/1086
-			if _, shouldSkip := skipHeaders[k]; shouldSkip {
-				continue
-			}
-			// otherwise, overwrite
-			dst.Del(k)
-		}
-		for _, v := range vv {
-			dst.Add(k, v)
+		if !shouldSkipHeader(dst, k) {
+			dst[k] = vv
 		}
 	}
 }
